@@ -3,25 +3,19 @@
 import argparse
 import csv
 import re
-import pprint
-import code
-import codecs
+import pdfplumber
+import sys
 
-# https://www.debuggex.com/
-# So far this works on every file tested.
-searcher = re.compile(r'^((?P<cisnum>(\d+\.)+\d+)\s)(\((?P<level>.+?)\)\s)?((?P<policy>.+))(\s\((?P<scored>Scored|Not\ Scored)\))$')
+# Updated regular expression to match recommendation lines more flexibly
+recommendation_pattern = re.compile(r'^(\d+\.\d+)\s+\((L\d+)\)\s+(.+?)(?:\s+\(Manual\)|\s+\(Automated\))?(?:\s*\.+\s*\d+)?$', re.IGNORECASE)
 
-garbage_list = [
-    '| P a g e'
-]
 
-modes = [
-    'Profile Applicability',
+fields = [
     'Description',
     'Rationale',
+    'Impact',
     'Audit',
     'Remediation',
-    'Impact',
     'Default Value',
     'References',
     'CIS Controls'
@@ -29,106 +23,95 @@ modes = [
 
 def buildBlank():
     return {
-        'Benchmark': None,
         'CIS #': '',
-        'Scored': '',
-        'Type': '',
-        'Policy': '',
-        'Profile Applicability': [],
+        'Level': '',
+        'Title': '',
         'Description': '',
         'Rationale': '',
+        'Impact': '',
         'Audit': '',
         'Remediation': '',
-        'Impact': '',
         'Default Value': '',
         'References': '',
         'CIS Controls': ''
     }
 
 def parseText(inFileName):
-    with open(inFileName, 'rt') as inFile:
-        print(f'Parsing {inFileName}')
-        outFileName = f'{inFileName}.csv'
-        with open(outFileName, 'wt', encoding='utf-8') as outFile:
-            print(f'Writing to {outFileName}')
-            outFile.write(str(codecs.BOM_UTF8))
-            cw = csv.DictWriter(outFile, fieldnames=list(buildBlank().keys()), quoting=csv.QUOTE_ALL)
-            cw.writeheader()
-            metrics_total = 0
-            metrics_good = 0
+    try:
+        with pdfplumber.open(inFileName) as pdf:
+            print(f'Parsing {inFileName}')
+            outFileName = f'{inFileName}.csv'
+            with open(outFileName, 'wt', newline='', encoding='utf-8') as outFile:
+                cw = csv.DictWriter(outFile, fieldnames=list(buildBlank().keys()), quoting=csv.QUOTE_ALL)
+                cw.writeheader()
 
-            row = None
-            cur_mode = None
-            force_write = False
+                start_processing = False
+                row = buildBlank()
+                current_field = None
+                line_count = 0
+                recommendations_found = 0
+                potential_recommendation = ''
 
-            for line in inFile:
-                line = line.replace('\n', '')
-                metrics_total += 1
-                # line = line.strip()
-                # Skip garbage lines here
-                if any(ele in line for ele in garbage_list):
-                    continue
+                for page_num, page in enumerate(pdf.pages, 1):
+                    print(f"Processing page {page_num}")
+                    lines = page.extract_text().split('\n')
+                    for line in lines:
+                        line_count += 1
+                        line = line.strip()
 
-                match = searcher.match(line)
-                if match or force_write:
-                    # Check if row is created, skips initial blanks
-                    if row:
-                        if row['Type'] == None:
-                            if len(row['Profile Applicability']) == 1:
-                                row['Type'] = row['Profile Applicability'][0]
-                            else:
-                                row['Type'] = 'See Profile Applicability'
-                        for key in row.keys():
-                            if isinstance(row[key], list):
-                                row[key] = '\n'.join(row[key])
-                        cw.writerow(row)
-                        # pprint.pprint(row)
-                        metrics_good += 1
-                        if force_write:
-                            break
-                    row = buildBlank()
-                    # code.interact(local=locals())
-                    row['Benchmark'] = inFileName[:-4]
-                    row['CIS #'] = match.group('cisnum')
-                    row['Type'] = match.group('level')
-                    row['Policy'] = match.group('policy')
-                    row['Scored'] = match.group('scored')
-                    cur_mode = None
-                    continue
+                        print(f"Line {line_count}: {line[:100]}")
 
-                else:
-                    mode_set = False
-                    for mode in modes:
-                        if line.startswith(f'{mode}:'):
-                            cur_mode = mode
-                            mode_set = True
-
-                    # Only do something on the line(s) after a mode set
-                    if not mode_set and cur_mode:
-                        # # Perform sanitization here.
-                        if cur_mode == 'Profile Applicability':
-                            line = line.replace('\uf0b7 ', '', 1)
-                        line = line.replace(' ', '', 1)
-                        # check if we have transitioned to Appendix
-                        if line.startswith('Appendix: Summary Table'):
-                            cur_mode = None
-                            force_write = True
+                        if "Recommendations" in line:
+                            start_processing = True
+                            print("Found 'Recommendations' section. Starting to process...")
                             continue
 
-                        if isinstance(row[cur_mode], str):
-                            row[cur_mode] += line
-                        elif isinstance(row[cur_mode], list):
-                            row[cur_mode].append(line.strip())
-                        else:
-                            print('ERROR: Bad type. This should never happen.')
-                            exit(-1)
+                        if not start_processing:
+                            continue
 
+                        if line.startswith("Appendix: Summary Table"):
+                            print("Reached summary table. Stopping processing.")
+                            break
 
-    print(f'Total lines: {metrics_total}')
-    print(f'Written Rows: {metrics_good}')
+                        match = recommendation_pattern.match(line)
+                        if match:
+                            if row['CIS #']:
+                                cw.writerow(row)
+                                print(f"Wrote row: CIS # {row['CIS #']}")
+                            row = buildBlank()
+                            row['CIS #'] = match.group(1)
+                            row['Level'] = match.group(2)
+                            row['Title'] = match.group(3)
+                            current_field = None
+                            recommendations_found += 1
+                            print(f"New recommendation: {row['CIS #']} - {row['Title']}")
+                            continue
+
+                        if any(field in line for field in fields):
+                            current_field = next(field for field in fields if field in line)
+                            print(f"New field: {current_field}")
+                            continue
+
+                        if current_field:
+                            row[current_field] += ' ' + line if row[current_field] else line
+
+                    if line.startswith("Appendix: Summary Table"):
+                        break
+
+                if row['CIS #']:
+                    cw.writerow(row)
+                    print(f"Wrote final row: CIS # {row['CIS #']}")
+
+            print(f'Finished processing {inFileName}')
+            print(f'Total lines processed: {line_count}')
+            print(f'Total recommendations found: {recommendations_found}')
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        print(f"Error details: {sys.exc_info()}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('inputFile', type=str, help='CIS text dump to parse.')
+    parser.add_argument('inputFile', type=str, help='CIS benchmark PDF to parse.')
     args = parser.parse_args()
     parseText(args.inputFile)
