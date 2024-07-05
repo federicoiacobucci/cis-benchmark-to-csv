@@ -6,9 +6,8 @@ import re
 import pdfplumber
 import sys
 
-# Updated regular expression to match recommendation lines more flexibly
-recommendation_pattern = re.compile(r'^(\d+\.\d+)\s+\((L\d+)\)\s+(.+?)(?:\s+\(Manual\)|\s+\(Automated\))?(?:\s*\.+\s*\d+)?$', re.IGNORECASE)
-
+# Updated regular expression to match recommendation lines
+recommendation_pattern = re.compile(r'(\d+\.\d+)\s+\((L\d+)\)\s+(.+?)\s+(?:\(Manual\)|\(Automated\))')
 
 fields = [
     'Description',
@@ -36,6 +35,16 @@ def buildBlank():
         'CIS Controls': ''
     }
 
+def extract_field_content(text, field, next_fields):
+    pattern = rf'{re.escape(field)}:(.*?)(?={"|".join(map(re.escape, next_fields))}|CIS Controls:|$)'
+    match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+    if match:
+        content = match.group(1).strip()
+        content = re.sub(r'Page \d+', '', content)
+        content = re.sub(r'\n+', '\n', content)  # Replace multiple newlines with a single newline
+        return content.strip()
+    return ''
+
 def parseText(inFileName):
     try:
         with pdfplumber.open(inFileName) as pdf:
@@ -46,64 +55,51 @@ def parseText(inFileName):
                 cw.writeheader()
 
                 start_processing = False
-                row = buildBlank()
-                current_field = None
-                line_count = 0
+                full_text = ''
                 recommendations_found = 0
-                potential_recommendation = ''
 
                 for page_num, page in enumerate(pdf.pages, 1):
+                    page_text = page.extract_text()
                     print(f"Processing page {page_num}")
-                    lines = page.extract_text().split('\n')
-                    for line in lines:
-                        line_count += 1
-                        line = line.strip()
-
-                        print(f"Line {line_count}: {line[:100]}")
-
-                        if "Recommendations" in line:
-                            start_processing = True
-                            print("Found 'Recommendations' section. Starting to process...")
-                            continue
-
-                        if not start_processing:
-                            continue
-
-                        if line.startswith("Appendix: Summary Table"):
-                            print("Reached summary table. Stopping processing.")
-                            break
-
-                        match = recommendation_pattern.match(line)
-                        if match:
-                            if row['CIS #']:
-                                cw.writerow(row)
-                                print(f"Wrote row: CIS # {row['CIS #']}")
-                            row = buildBlank()
-                            row['CIS #'] = match.group(1)
-                            row['Level'] = match.group(2)
-                            row['Title'] = match.group(3)
-                            current_field = None
-                            recommendations_found += 1
-                            print(f"New recommendation: {row['CIS #']} - {row['Title']}")
-                            continue
-
-                        if any(field in line for field in fields):
-                            current_field = next(field for field in fields if field in line)
-                            print(f"New field: {current_field}")
-                            continue
-
-                        if current_field:
-                            row[current_field] += ' ' + line if row[current_field] else line
-
-                    if line.startswith("Appendix: Summary Table"):
+                    print(f"First 100 characters: {page_text[:100]}")
+                    
+                    if "Recommendations" in page_text:
+                        start_processing = True
+                        print(f"Found 'Recommendations' on page {page_num}")
+                    
+                    if start_processing:
+                        full_text += page_text + '\n'
+                    
+                    if "Appendix: Summary Table" in page_text:
+                        print(f"Found 'Appendix: Summary Table' on page {page_num}")
                         break
 
-                if row['CIS #']:
+                print(f"Total text length: {len(full_text)}")
+                print(f"First 500 characters of processed text: {full_text[:500]}")
+
+                recommendations = recommendation_pattern.findall(full_text)
+                print(f"Found {len(recommendations)} potential recommendations")
+
+                for i, rec in enumerate(recommendations):
+                    cis_num, level, title = rec
+                    row = buildBlank()
+                    row['CIS #'] = cis_num
+                    row['Level'] = level
+                    row['Title'] = title
+
+                    start_index = full_text.index(f"{cis_num} ({level})")
+                    end_index = full_text.index(f"{recommendations[i+1][0]} ({recommendations[i+1][1]})") if i < len(recommendations) - 1 else len(full_text)
+                    section_text = full_text[start_index:end_index]
+
+                    for j, field in enumerate(fields):
+                        next_fields = fields[j+1:] + ['Profile Applicability', 'CIS Controls']
+                        row[field] = extract_field_content(section_text, field, next_fields)
+
                     cw.writerow(row)
-                    print(f"Wrote final row: CIS # {row['CIS #']}")
+                    recommendations_found += 1
+                    print(f"Processed recommendation: {row['CIS #']} - {row['Title']}")
 
             print(f'Finished processing {inFileName}')
-            print(f'Total lines processed: {line_count}')
             print(f'Total recommendations found: {recommendations_found}')
 
     except Exception as e:
